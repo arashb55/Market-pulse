@@ -1,0 +1,6 @@
+{
+  "telegram_bot_token": "",
+  "telegram_chat_id": "",
+  "telegram_always": false,
+  "never_open_browser": false
+}
