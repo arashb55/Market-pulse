@@ -184,20 +184,25 @@ DIVERGING = [[0.0, DOWN], [0.25, _mix(NEUTRAL, DOWN, 0.6)], [0.5, NEUTRAL],
 def base_layout(fig, height, **kw):
     kw.setdefault("margin", dict(l=8, r=8, t=8, b=8))
     kw.setdefault("showlegend", False)
+    kw.setdefault("dragmode", False)
     fig.update_layout(
         height=height,
         paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
         font=dict(family='system-ui,-apple-system,"Segoe UI",sans-serif', color=INK2, size=12),
         hoverlabel=dict(bgcolor="#262624", bordercolor=BASE, font=dict(color=INK, size=12)),
         **kw)
-    fig.update_xaxes(gridcolor=GRID, zerolinecolor=BASE, linecolor=BASE, tickfont=dict(color=MUTED))
-    fig.update_yaxes(gridcolor=GRID, zerolinecolor=BASE, linecolor=BASE, tickfont=dict(color=MUTED))
+    # fixedrange: lock the zoom so scrolling/swiping past a chart never zooms it
+    fig.update_xaxes(gridcolor=GRID, zerolinecolor=BASE, linecolor=BASE, tickfont=dict(color=MUTED),
+                     fixedrange=True)
+    fig.update_yaxes(gridcolor=GRID, zerolinecolor=BASE, linecolor=BASE, tickfont=dict(color=MUTED),
+                     fixedrange=True)
     return fig
 
 
 def fig_html(fig, div_id):
     return fig.to_html(full_html=False, include_plotlyjs=False, div_id=div_id,
-                       config={"displayModeBar": False, "responsive": True})
+                       config={"displayModeBar": False, "responsive": True,
+                               "scrollZoom": False, "doubleClick": False})
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -361,6 +366,33 @@ def _intraday(yf, tickers, interval="30m"):
     return ic
 
 
+def _retry_missing(yf, close, tickers, tries=3):
+    """Yahoo occasionally drops a ticker from a bulk download (e.g. XLF vanishing from
+    the sector list). Re-download any ticker with no data, one at a time."""
+    for attempt in range(tries):
+        missing = [t for t in tickers if t not in close or close[t].dropna().size < 2]
+        if not missing:
+            break
+        print(f"      retrying {len(missing)} missing ticker(s): {', '.join(missing)}")
+        time.sleep(2 * (attempt + 1))
+        for t in missing:
+            try:
+                raw = yf.download(t, period="1y", interval="1d", auto_adjust=True,
+                                  progress=False, threads=False)
+                if raw is None or raw.empty:
+                    continue
+                c, _ = _closes(raw)
+                col = c.iloc[:, 0].rename(t)
+                if col.dropna().size >= 2:
+                    close = close.drop(columns=[t], errors="ignore").join(col, how="outer")
+            except Exception as e:
+                print(f"      ! {t}: {e}")
+    still = [t for t in tickers if t not in close or close[t].dropna().size < 2]
+    if still:
+        print(f"  ! no data after retries: {', '.join(still)}")
+    return close.sort_index()
+
+
 def fetch_live():
     import yfinance as yf
     print("[1/4] Downloading indexes, rates, commodities, crypto, sectors...")
@@ -368,6 +400,7 @@ def fetch_live():
     raw = yf.download(macro, period="1y", interval="1d", auto_adjust=True,
                       progress=False, threads=True, group_by="column")
     mclose, _ = _closes(raw)
+    mclose = _retry_missing(yf, mclose, macro)
 
     uni = load_universe()
     print(f"[2/4] Downloading {len(uni)} S&P 500 stocks (about 30-60 seconds)...")
