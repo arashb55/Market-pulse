@@ -1,0 +1,72 @@
+name: Market Pulse
+
+on:
+  schedule:
+    - cron: "40 13,14 * * 1-5"
+    - cron: "35 16,17 * * 1-5"
+    - cron: "10 20,21 * * 1-5"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: market-pulse
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install packages
+        run: pip install -r requirements.txt
+      - name: Restore earlier snapshots and cache
+        run: |
+          mkdir -p site cache
+          if git fetch --depth 1 origin snapshots 2>/dev/null; then
+            git archive FETCH_HEAD | tar -x
+          fi
+      - name: Build dashboard
+        env:
+          MP_SITE: "1"
+          MP_OUT_DIR: site
+          MP_CACHE_DIR: cache
+          MP_LOCAL_TZ: Etc/GMT+7
+          MP_KEEP_DAYS: "45"
+        run: |
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            python market_pulse.py --auto --no-open
+          else
+            python market_pulse.py --no-open
+          fi
+      - name: Save snapshots
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          rm -rf "$RUNNER_TEMP/snap" && mkdir "$RUNNER_TEMP/snap"
+          cp -r site cache "$RUNNER_TEMP/snap/"
+          cd "$RUNNER_TEMP/snap"
+          git init -q -b snapshots
+          git add -A
+          git -c user.name="market-pulse-bot" -c user.email="bot@users.noreply.github.com" commit -qm "snapshots"
+          git push -qf "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" snapshots
+      - uses: actions/configure-pages@v5
+        if: hashFiles('site/index.html') != ''
+      - uses: actions/upload-pages-artifact@v3
+        if: hashFiles('site/index.html') != ''
+        with:
+          path: site
+      - id: deploy
+        if: hashFiles('site/index.html') != ''
+        uses: actions/deploy-pages@v4
