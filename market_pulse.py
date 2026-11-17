@@ -67,15 +67,18 @@ _ensure_packages()
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
-from plotly.offline import get_plotlyjs
+from plotly.offline import get_plotlyjs, get_plotlyjs_version
 from plotly.subplots import make_subplots
 
 # ════════════════════════════════════════════════════════════════════════════
 # CONFIG - edit freely
 # ════════════════════════════════════════════════════════════════════════════
 BASE_DIR = Path(__file__).resolve().parent
-OUT_DIR = BASE_DIR / "output"
-CACHE_DIR = BASE_DIR / "cache"
+OUT_DIR = Path(os.environ.get("MP_OUT_DIR", BASE_DIR / "output")).resolve()
+CACHE_DIR = Path(os.environ.get("MP_CACHE_DIR", BASE_DIR / "cache")).resolve()
+# Website mode (GitHub Pages): index.html + history.html, plotly from CDN, old snapshots pruned
+SITE_MODE = os.environ.get("MP_SITE", "") == "1"
+KEEP_DAYS = int(os.environ.get("MP_KEEP_DAYS", "45" if SITE_MODE else "0"))  # 0 = keep forever
 LOCAL_TZ = ZoneInfo(os.environ.get("MP_LOCAL_TZ", "America/Vancouver"))
 NY = ZoneInfo("America/New_York")
 
@@ -328,6 +331,36 @@ def _one_row_per_day(df):
     return pd.DataFrame(out)
 
 
+def patch_missing_today(close, intraday):
+    """After the close Yahoo often hasn't published today's DAILY bar for stocks/ETFs yet
+    (indexes are fine). Fill any missing value for the latest session from intraday bars."""
+    if intraday is None or intraday.empty:
+        return close, 0
+    close = close.copy()
+    day = intraday.dropna(how="all").index[-1].date()
+    today = intraday[intraday.index.date == day]
+    key = pd.Timestamp(day)
+    if key not in close.index:
+        close = pd.concat([close, pd.DataFrame(index=[key], columns=close.columns, dtype=float)]).sort_index()
+    filled = 0
+    for t in close.columns:
+        if t in today and np.isnan(close.at[key, t]):
+            v = today[t].dropna()
+            if len(v):
+                close.at[key, t] = float(v.iloc[-1])
+                filled += 1
+    return close.dropna(how="all"), filled
+
+
+def _intraday(yf, tickers, interval="30m"):
+    raw = yf.download(tickers, period="5d", interval=interval, auto_adjust=True,
+                      progress=False, threads=True, group_by="column", prepost=False)
+    ic = raw["Close"] if isinstance(raw.columns, pd.MultiIndex) else raw[["Close"]].rename(columns={"Close": tickers[0]})
+    ic.index = pd.to_datetime(ic.index)
+    ic.index = ic.index.tz_convert(NY) if ic.index.tz is not None else ic.index.tz_localize("UTC").tz_convert(NY)
+    return ic
+
+
 def fetch_live():
     import yfinance as yf
     print("[1/4] Downloading indexes, rates, commodities, crypto, sectors...")
@@ -352,6 +385,19 @@ def fetch_live():
     except Exception as e:
         print(f"  ! intraday unavailable: {e}")
         ic = pd.DataFrame()
+
+    # Fill in today's price where Yahoo's daily bar is still missing (common after the close)
+    try:
+        print("      checking for missing daily bars...")
+        eq_macro = [t for t in macro if not t.endswith(("=F", "=X", "-USD")) and not t.startswith("^")
+                    and t != "DX-Y.NYB"]
+        mclose, f1 = patch_missing_today(mclose, _intraday(yf, eq_macro))
+        uclose, f2 = patch_missing_today(uclose, _intraday(yf, list(uni["ticker"])))
+        uvol = uvol.reindex(uclose.index)
+        if f1 + f2:
+            print(f"      filled today's price for {f1 + f2} tickers from intraday data")
+    except Exception as e:
+        print(f"  ! could not patch missing bars: {e}")
 
     mcaps = load_market_caps(list(uni["ticker"]))
     return dict(macro=mclose, uclose=uclose, uvol=uvol, intraday=ic, universe=uni, mcaps=mcaps)
@@ -652,7 +698,7 @@ def chart_intraday(intra):
                            xshift=8, font=dict(color=INK2, size=11))
     day = pd.Timestamp(intra["day"])
     fig.add_hline(y=0, line=dict(color=BASE, width=1))
-    base_layout(fig, 300, hovermode="x unified", margin=dict(l=8, r=150, t=8, b=8))
+    base_layout(fig, 300, hovermode="x unified", margin=dict(l=4, r=125, t=8, b=8))
     fig.update_yaxes(ticksuffix="%", zeroline=False)
     fig.update_xaxes(tickformat="%H:%M", showgrid=False,
                      range=[day + pd.Timedelta(hours=9, minutes=30), day + pd.Timedelta(hours=16)])
@@ -668,7 +714,7 @@ def chart_bars(labels, vals, height=None, hover_extra=None):
         x=vals, y=labels, orientation="h", marker=dict(color=[chg_color(v) for v in vals], line=dict(width=0)),
         text=[f"{v:+.2f}%" for v in vals], textposition="outside", textfont=dict(color=INK2, size=11),
         customdata=extra, hovertemplate="%{customdata}: %{x:+.2f}%<extra></extra>", cliponaxis=False))
-    span = max(abs(min(vals)), abs(max(vals)), 0.5) * 1.35
+    span = max(abs(min(vals)), abs(max(vals)), 0.5) * 1.6
     base_layout(fig, height or max(240, 26 * len(vals) + 30), bargap=0.28,
                 margin=dict(l=8, r=16, t=4, b=8))
     fig.update_xaxes(range=[-span, span], ticksuffix="%", zeroline=True, zerolinecolor=BASE, showgrid=False)
@@ -694,14 +740,15 @@ def chart_treemap(u: pd.DataFrame):
         marker=dict(colors=colors, colorscale=DIVERGING, cmin=-3, cmid=0, cmax=3,
                     line=dict(color=PAGE, width=1.2), pad=dict(t=20, l=2, r=2, b=2),
                     colorbar=dict(title="", ticksuffix="%", tickvals=[-3, -2, -1, 0, 1, 2, 3],
-                                  thickness=10, len=0.6, tickfont=dict(color=MUTED, size=10),
+                                  orientation="h", x=0.5, xanchor="center", y=-0.01, yanchor="top",
+                                  thickness=8, len=0.5, tickfont=dict(color=MUTED, size=10),
                                   outlinewidth=0)),
         customdata=custom,
         texttemplate="<b>%{label}</b><br>%{customdata[2]:+.2f}%",
         textfont=dict(color="#ffffff", size=13), textposition="middle center",
         hovertemplate="<b>%{label}</b> %{customdata[0]}<br>%{customdata[1]}  %{customdata[2]:+.2f}%<extra></extra>",
         pathbar=dict(visible=True, textfont=dict(size=12)), maxdepth=3, tiling=dict(pad=0)))
-    return base_layout(fig, 640, margin=dict(l=0, r=0, t=26, b=0))
+    return base_layout(fig, 660, margin=dict(l=0, r=0, t=26, b=34))
 
 
 def chart_ratios(ratios):
@@ -918,6 +965,19 @@ table.mv .barc i{display:block;height:6px;border-radius:3px}
 .links a{color:#f0efec;text-decoration:none;background:#262624;padding:7px 12px;border-radius:8px;font-size:12.5px}
 .links a:hover{background:#30302d}
 footer{color:#898781;font-size:11.5px;margin-top:18px}
+.navlink{display:inline-block;color:#f0efec;text-decoration:none;background:#262624;padding:6px 12px;border-radius:8px;margin-bottom:6px;font-size:13px}
+@media(max-width:700px){
+ .wrap{padding:10px 8px 30px}
+ header{align-items:flex-start}
+ h1{font-size:21px}.stamp{text-align:left;font-size:12px}
+ .grid{gap:10px}.card{padding:10px 10px;border-radius:12px}
+ .tiles{grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}
+ .tile{padding:8px 9px 7px}.t-val{font-size:18px}.t-name{font-size:11.5px}.t-chg{font-size:12px}
+ .t-foot{font-size:10px;gap:4px}
+ table.heat{font-size:11.5px}table.heat td{padding:5px 2px}
+ .kv{grid-template-columns:1fr}
+ table.mv .nm{display:none}
+}
 """
 
 
@@ -954,7 +1014,7 @@ def build_html(res, data, session_label, now_ny, demo=False):
 <div class="wrap">
 <header>
   <h1>Market Pulse <span class="pill">{session_label}</span>{' <span class="pill">DEMO DATA</span>' if demo else ''}</h1>
-  <div class="stamp">{now_local:%A, %B %d %Y · %H:%M} local · {now_ny:%H:%M} New York<br>
+  <div class="stamp">{'<a class="navlink" href="{{HISTORY_URL}}">📅 History</a><br>' if SITE_MODE else ''}{now_local:%A, %B %d %Y · %H:%M} local · {now_ny:%H:%M} New York<br>
   Data via Yahoo Finance · prices may be delayed ~15 min</div>
 </header>
 <div class="grid">
@@ -989,8 +1049,16 @@ Yields change in basis points. Regime score = share of risk-on signals. For info
 </div>"""
     return (f'<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">'
             f'<meta name="viewport" content="width=device-width,initial-scale=1">'
+            f'<meta name="theme-color" content="#0d0d0d"><meta name="mobile-web-app-capable" content="yes">'
+            f'<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22%3E%3Ctext y=%22.9em%22 font-size=%2290%22%3E%F0%9F%93%88%3C/text%3E%3C/svg%3E">'
             f'<title>Market Pulse · {session_label} · {now_ny:%b %d}</title>'
-            f'<style>{CSS}</style><script>{get_plotlyjs()}</script></head><body>{body}</body></html>'), summary
+            f'<style>{CSS}</style>{plotly_tag()}</head><body>{body}</body></html>'), summary
+
+
+def plotly_tag():
+    if SITE_MODE:  # small files for the website; the phone downloads plotly once and caches it
+        return f'<script src="https://cdn.plot.ly/plotly-{get_plotlyjs_version()}.min.js" charset="utf-8"></script>'
+    return f"<script>{get_plotlyjs()}</script>"  # fully offline single file
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -1019,6 +1087,49 @@ def send_telegram(summary, path, settings):
         print("  sent to Telegram")
     except Exception as e:
         print(f"  ! Telegram failed: {e}")
+
+
+SLUG_LABEL = {"open": "Open", "midday": "Midday", "close": "Close"}
+
+
+def prune_and_index(now_ny):
+    """Delete snapshots older than KEEP_DAYS and (website mode) write history.html."""
+    arch = OUT_DIR / "archive"
+    files = sorted(arch.glob("*.html"))
+    if KEEP_DAYS:
+        cutoff = (now_ny - timedelta(days=KEEP_DAYS)).strftime("%Y-%m-%d")
+        for f in files:
+            if f.name[:10] < cutoff:
+                f.unlink()
+        files = sorted(arch.glob("*.html"))
+    if not SITE_MODE:
+        return
+    days = {}
+    for f in files:
+        day, _, slug = f.stem.partition("_")
+        days.setdefault(day, []).append((slug, f.name))
+    order = {"open": 0, "midday": 1, "close": 2}
+    rows = ""
+    for day in sorted(days, reverse=True):
+        d = datetime.strptime(day, "%Y-%m-%d")
+        btns = "".join(
+            f'<a class="b {s if s in order else "other"}" href="archive/{n}">{SLUG_LABEL.get(s, s.replace("-", " ").title())}</a>'
+            for s, n in sorted(days[day], key=lambda x: order.get(x[0], 9)))
+        rows += f'<div class="day"><div class="d"><b>{d:%a}</b> {d:%b %d, %Y}</div><div class="bs">{btns}</div></div>'
+    page = f"""<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#0d0d0d">
+<title>Market Pulse · History</title><style>
+body{{margin:0;background:#0d0d0d;color:#f0efec;font:15px/1.4 system-ui,-apple-system,"Segoe UI",sans-serif}}
+.w{{max-width:720px;margin:0 auto;padding:18px 14px 40px}} h1{{font-size:22px;margin:0 0 4px}}
+.top a{{color:#f0efec;text-decoration:none;background:#262624;padding:8px 14px;border-radius:8px;display:inline-block;margin:10px 0 16px}}
+.day{{display:flex;justify-content:space-between;align-items:center;gap:10px;background:#1a1a19;border:1px solid rgba(255,255,255,.08);border-radius:12px;padding:12px 14px;margin-bottom:8px;flex-wrap:wrap}}
+.d{{color:#c3c2b7}} .d b{{color:#f0efec;display:inline-block;width:38px}} .bs{{display:flex;gap:8px}}
+.b{{text-decoration:none;color:#f0efec;background:#2a2a28;padding:8px 14px;border-radius:8px;font-weight:600;font-size:14px}}
+.b.open{{border-left:3px solid #3987e5}} .b.midday{{border-left:3px solid #c98500}} .b.close{{border-left:3px solid #199e70}}
+.mut{{color:#898781;font-size:13px}}</style></head><body><div class="w">
+<h1>📅 Snapshot history</h1><div class="mut">Last {KEEP_DAYS} days · times are New York open, midday and close</div>
+<div class="top"><a href="index.html">← Latest dashboard</a></div>{rows or '<p class="mut">No snapshots yet.</p>'}</div></body></html>"""
+    (OUT_DIR / "history.html").write_text(page, encoding="utf-8")
 
 
 def current_session(now_ny):
@@ -1050,25 +1161,29 @@ def main():
         if key is None:
             print(f"{now_ny:%H:%M} ET - outside snapshot windows ({label}); nothing to do.")
             return
-        marker = OUT_DIR / "state" / f"{now_ny:%Y-%m-%d}_{key}.done"
+        marker = CACHE_DIR / "state" / f"{now_ny:%Y-%m-%d}_{key}.done"
         if marker.exists():
             print(f"{label} snapshot already built today.")
             return
     if args.session:
         label = args.session
+        for k, l, _, _ in SESSIONS:
+            if args.session.lower() in (k, l.lower()):
+                key, label = k, l
 
     data = fetch_demo() if args.demo else fetch_live()
     print("[4/4] Building the dashboard...")
     res = compute(data)
     page, summary = build_html(res, data, label, now_ny, demo=args.demo)
 
-    OUT_DIR.mkdir(exist_ok=True)
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
     (OUT_DIR / "archive").mkdir(exist_ok=True)
-    latest = OUT_DIR / "market_pulse_latest.html"
-    latest.write_text(page, encoding="utf-8")
+    latest = OUT_DIR / ("index.html" if SITE_MODE else "market_pulse_latest.html")
+    latest.write_text(page.replace("{{HISTORY_URL}}", "history.html"), encoding="utf-8")
     slug = (key or label.lower().replace(" ", "-"))
     arch = OUT_DIR / "archive" / f"{now_ny:%Y-%m-%d}_{slug}.html"
-    arch.write_text(page, encoding="utf-8")
+    arch.write_text(page.replace("{{HISTORY_URL}}", "../history.html"), encoding="utf-8")
+    prune_and_index(now_ny)
     print(summary)
     print(f"\nSaved: {latest}")
 
@@ -1078,8 +1193,8 @@ def main():
     if not args.no_open and not settings.get("never_open_browser"):
         webbrowser.open(latest.as_uri())
     if args.auto:
-        (OUT_DIR / "state").mkdir(exist_ok=True)
-        (OUT_DIR / "state" / f"{now_ny:%Y-%m-%d}_{key}.done").write_text(datetime.now().isoformat())
+        (CACHE_DIR / "state").mkdir(parents=True, exist_ok=True)
+        (CACHE_DIR / "state" / f"{now_ny:%Y-%m-%d}_{key}.done").write_text(datetime.now().isoformat())
 
 
 if __name__ == "__main__":
